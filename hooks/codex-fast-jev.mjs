@@ -52,6 +52,17 @@ function clip(text, limit) {
   return text.length <= limit ? text : `${text.slice(0, limit)}\n[… ${text.length - limit} chars clipped …]`;
 }
 
+// Re-injecting opaque bytes (Fernet-encrypted subagent payloads, raw base64
+// dumps) wastes the budget: the model cannot read them and they crowd out
+// legible results. Skip a pair whose output is dominated by such a blob.
+function looksOpaque(text) {
+  if (text.startsWith('gAAAAA')) return true; // Fernet token
+  const longest = (text.match(/\S{200,}/g) ?? []).reduce((a, s) => Math.max(a, s.length), 0);
+  if (longest === 0) return false;
+  const b64 = (text.match(/[A-Za-z0-9+/_=-]/g) ?? []).length / text.length;
+  return longest >= 400 && b64 > 0.9;
+}
+
 function fakeAsker() {
   return {
     async ask(_state, questions) {
@@ -80,8 +91,6 @@ async function main() {
 
   const asker = dry ? fakeAsker() : new JevClient({ apiKey });
   const result = await compactCodexItems(items, asker, {});
-  trace('decisions', result.decisions.length,
-    result.decisions.filter((d) => d.reason === 'kept').length, 'kept');
 
   const byId = new Map();
   for (const item of items) {
@@ -92,22 +101,37 @@ async function main() {
     byId.set(item.call_id, slot);
   }
 
+  // Codex has already discarded this history, so there is nothing to protect by
+  // leaving a result out — the only question is what to restore. Rank every
+  // scored pair by how much Jev wants it (result verbatim first, then the call)
+  // and inject the best until the budget fills, rather than gating on a fixed
+  // keep threshold that a compressed transcript rarely clears.
+  const MIN_SCORE = Number(process.env.FAST_JEV_MIN_SCORE ?? '0.2');
+  const scored = result.decisions
+    .filter((d) => d.reason !== 'pinned')
+    .map((d) => ({ d, score: Math.max(d.keepResult ?? 0, d.keepCall ?? 0) }))
+    .filter((x) => x.score >= MIN_SCORE)
+    .sort((a, b) => b.score - a.score);
+  trace('decisions', result.decisions.length, 'eligible', scored.length,
+    'top', scored.slice(0, 3).map((x) => x.score.toFixed(2)).join(','));
+
   const sections = [];
   let used = 0;
-  for (const decision of result.decisions) {
-    if (decision.reason !== 'kept') continue;
-    const pair = byId.get(decision.call_id);
+  for (const { d, score } of scored) {
+    const pair = byId.get(d.call_id);
     if (!pair?.call || typeof pair.output?.output !== 'string') continue;
-    const args = typeof pair.call.arguments === 'string' ? pair.call.arguments
+    if (looksOpaque(pair.output.output)) continue;
+    const rawArgs = typeof pair.call.arguments === 'string' ? pair.call.arguments
       : typeof pair.call.input === 'string' ? pair.call.input : '';
-    const section = `### ${decision.tool} (${decision.id})\nargs: ${clip(args, MAX_ARGS_CHARS)}\noutput:\n${clip(pair.output.output, MAX_OUTPUT_CHARS)}`;
+    const args = looksOpaque(rawArgs) ? '[opaque payload omitted]' : clip(rawArgs, MAX_ARGS_CHARS);
+    const section = `### ${d.tool} [keep ${score.toFixed(2)}]\nargs: ${args}\noutput:\n${clip(pair.output.output, MAX_OUTPUT_CHARS)}`;
     if (used + section.length > MAX_CONTEXT_CHARS) break;
     sections.push(section);
     used += section.length;
   }
   if (sections.length === 0) return;
 
-  const header = 'Verbatim tool results from before compaction that Jev scored as still needed for the ongoing task (the native summary above may have lost them):';
+  const header = 'Verbatim tool results from before compaction, ranked by how relevant Jev judged them to the ongoing task. Codex\'s native summary may have dropped these — treat them as recovered context:';
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
       hookEventName: 'SessionStart',
